@@ -174,6 +174,13 @@ object Hooks {
         java.util.WeakHashMap<Activity, Int>()
     )
 
+    private val gStatusBarTouched = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Activity, Boolean>()
+    )
+    private val gNavBarTouched = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Activity, Boolean>()
+    )
+
     private val gFeedViewportNativeBottomMargins = java.util.Collections.synchronizedMap(
         java.util.WeakHashMap<View, Int>()
     )
@@ -221,6 +228,20 @@ object Hooks {
     private var gTopZoneStartY = 0f
     private const val TOP_ZONE_HEIGHT = 250
 
+    private const val TOP_LONG_PRESS_PREF = "top_long_press_toggle"
+    private const val TOP_LONG_PRESS_ZONE_DP = 120f
+    private const val TOP_LONG_PRESS_TIMEOUT_MS = 500L
+    private const val TOP_LONG_PRESS_SLOP_DP = 24f
+    private var gTopLongPressOn = true
+    private var gLongPressTracking = false
+    private var gLongPressConsuming = false
+    private var gLongPressStartX = 0f
+    private var gLongPressStartY = 0f
+    private var gLongPressLocalX = 0f
+    private var gLongPressLocalY = 0f
+    private var gLongPressRunnable: Runnable? = null
+    @Volatile private var gInjectingCancel = false
+
     private val seedIds = intArrayOf(
         0x7F0B03E3, 0x7F0B071E, 0x7F0B0412,
         0x7F0B0BCB, 0x7F0A00D2, 0x7F0B0C6A,
@@ -237,6 +258,7 @@ object Hooks {
             gAdOn = gPrefs!!.getBoolean("ad_block", false)
             gRefreshOff = gPrefs!!.getBoolean("pull_refresh", false)
             gTopZoneOn = gPrefs!!.getBoolean("top_zone", false)
+            gTopLongPressOn = gPrefs!!.getBoolean(TOP_LONG_PRESS_PREF, true)
             gNavBarOff = gPrefs!!.getBoolean("nav_bar_off", false)
             gProgressOff = gPrefs!!.getBoolean("progress_off", false)
             gRestoreControlsOnPause = gPrefs!!.getBoolean("restore_controls_pause", false)
@@ -867,6 +889,7 @@ object Hooks {
         if (clear) synchronized(gKnownFeedViewportViews) { gKnownFeedViewportViews.clear() }
         if (entries.isNotEmpty()) LogUtil.info("首页视频底部占位已恢复 | count=${entries.size}")
     }
+
 
     private fun reflectIntField(obj: Any?, name: String): Int? {
         if (obj == null) return null
@@ -2271,6 +2294,7 @@ object Hooks {
                 }
                 decor.requestApplyInsets()
                 updateSeriesMallTopMargin(act, true)
+                synchronized(gStatusBarTouched) { gStatusBarTouched[act] = true }
             }
 
             applyOnce()
@@ -2286,6 +2310,25 @@ object Hooks {
         }
     }
 
+    private fun isSystemBarHidden(act: Activity, statusBar: Boolean): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                val insets = act.window?.decorView?.rootWindowInsets ?: return false
+                val type = if (statusBar) WindowInsets.Type.statusBars() else WindowInsets.Type.navigationBars()
+                !insets.isVisible(type)
+            } else {
+                @Suppress("DEPRECATION")
+                (act.window.attributes.flags and WindowManager.LayoutParams.FLAG_FULLSCREEN) != 0
+            }
+        } catch (_: Throwable) { false }
+    }
+
+    private fun systemBarsMatchTarget(act: Activity): Boolean {
+        val statusOk = isSystemBarHidden(act, true) == gStatusOn
+        val navOk = isSystemBarHidden(act, false) == gNavBarOff
+        return statusOk && navOk
+    }
+
     private fun reapplyAfterWindowModeChange(
         act: Activity?,
         reason: String,
@@ -2295,13 +2338,19 @@ object Hooks {
         for (delay in longArrayOf(0L, 180L)) mainHandler.postDelayed({
             if (act.isFinishing) return@postDelayed
             val windowed = isWindowedMode(act)
-            if (gLastWindowedMode != windowed) {
+            val modeChanged = gLastWindowedMode != windowed
+            if (modeChanged) {
                 gLastWindowedMode = windowed
                 LogUtil.info("window mode -> ${if (windowed) "windowed" else "fullscreen"}, reason=$reason")
             }
+
+            val alreadySettled = !modeChanged && systemBarsMatchTarget(act)
             if (gStatusOn) applyCleanTop(act) else showStatusBar(act)
             if (gNavBarOff) applyNavBar(act) else showNavBar(act)
-            if (refreshLayout) refreshShortVideoWindowLayout(act)
+
+            val needRefresh = refreshLayout && !alreadySettled &&
+                (modeChanged || isWindowedMode(act))
+            if (needRefresh) refreshShortVideoWindowLayout(act)
         }, delay)
     }
 
@@ -2314,7 +2363,8 @@ object Hooks {
         reapplyAfterWindowModeChange(act, reason, refreshLayout)
         mainHandler.postDelayed({
             if (act.isFinishing) return@postDelayed
-            if (refreshLayout) refreshShortVideoWindowLayout(act)
+
+            if (refreshLayout && isWindowedMode(act)) refreshShortVideoWindowLayout(act)
             if (gRestoreControlsOnPause) {
                 refreshVideoPauseState("series-window:$reason")
             }
@@ -2367,10 +2417,14 @@ object Hooks {
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             decor.requestApplyInsets()
             updateSeriesMallTopMargin(act, true)
+            synchronized(gStatusBarTouched) { gStatusBarTouched[act] = true }
         } catch (_: Exception) {}
     }
     private fun showStatusBar(act: Activity?) {
         if (act == null) return
+
+        val touched = synchronized(gStatusBarTouched) { gStatusBarTouched.remove(act) }
+        if (touched != true) return
         try {
             val window = act.window ?: return
             val decor = window.decorView
@@ -2464,9 +2518,13 @@ object Hooks {
     private fun applyNavBar(act: Activity?) {
         if (act == null || !gMasterOn || !gNavBarOff) return
         applyBottomEdgeToEdge(act, true)
+        synchronized(gNavBarTouched) { gNavBarTouched[act] = true }
     }
     private fun showNavBar(act: Activity?) {
         if (act == null) return
+
+        val touched = synchronized(gNavBarTouched) { gNavBarTouched.remove(act) }
+        if (touched != true) return
         try {
             val decor = act.window.decorView
             if (Build.VERSION.SDK_INT >= 30) decor.windowInsetsController?.show(WindowInsets.Type.navigationBars())
@@ -3157,7 +3215,7 @@ object Hooks {
             }, "master_on", true)
 
             content.addView(sectionTitle(act, "界面精简", p))
-            addSwitch("隐藏状态栏", "视频页面沉浸显示", { gStatusOn }, { gStatusOn = it }, "status_bar")
+            addSwitch("隐藏状态栏", "视频页面沉浸显示；开启后部分视频会改为留黑边显示", { gStatusOn }, { gStatusOn = it }, "status_bar")
             addSwitch("隐藏控件", "隐藏顶部/底部导航、作品信息和右侧互动等已适配区域", { gControlOn }, {
                 gControlOn = it
                 if (!it) {
@@ -3180,7 +3238,7 @@ object Hooks {
                     for (root in roots) scanTreeProgressRestore(root)
                 }
             }, "progress_off")
-            addSwitch("隐藏底部小白条", "隐藏系统手势导航提示条", { gNavBarOff }, { gNavBarOff = it }, "nav_bar_off")
+            addSwitch("隐藏底部小白条", "隐藏系统手势导航提示条；开启后部分视频会改为留黑边显示", { gNavBarOff }, { gNavBarOff = it }, "nav_bar_off")
             addSwitch("暂停后恢复所有控件", "暂停视频时临时恢复控件，继续播放后按规则隐藏", { gRestoreControlsOnPause }, {
                 gRestoreControlsOnPause = it
                 if (it) refreshVideoPauseState("switch-enabled", gVideoPaused)
@@ -3223,6 +3281,16 @@ object Hooks {
                 if (!it) restoreRefreshAccessories() else mainHandler.post { scanAllWindows() }
             }, "pull_refresh")
             addSwitch("顶部区域拦截下滑", "拦截屏幕顶部区域向下滑动手势", { gTopZoneOn }, { gTopZoneOn = it }, "top_zone")
+            addSwitch(
+                "长按顶部切换界面精简",
+                "长按屏幕顶部 120dp 区域，切换隐藏 / 恢复：控件、选集控件、进度条",
+                { gTopLongPressOn },
+                {
+                    gTopLongPressOn = it
+                    if (!it) resetTopLongPressState()
+                },
+                TOP_LONG_PRESS_PREF,
+            )
 
             content.addView(sectionTitle(act, "内容与账号", p))
             addSwitch("拦截广告 / 挂件", "拦截已适配的广告层、金宝箱和悬浮挂件", { gAdOn }, { gAdOn = it }, "ad_block")
@@ -3355,6 +3423,120 @@ object Hooks {
         } catch (_: Exception) {}
         return false
     }
+
+
+    private fun applyCleanUiGroup(hide: Boolean, reason: String) {
+        val act = gCurrentActivity
+
+        gControlOn = hide
+        gPlayerOn = hide
+        gProgressOff = hide
+        savePref("control_hide", hide)
+        savePref("player_bar", hide)
+        savePref("progress_off", hide)
+
+        if (hide) {
+            setVideoToolbarsVisible(gRestoreControlsOnPause && gVideoPaused)
+        } else {
+            restoreAllSavedViews()
+            restoreShortVideoNativeControls()
+            restoreNativeBottomWindowColor(act)
+            setVideoToolbarsVisible(true)
+            for (root in collectAllWindows()) scanTreeProgressRestore(root)
+            mainHandler.postDelayed({ restoreShortVideoNativeControls(); scanAllWindows() }, 120L)
+        }
+        applyToCurrent()
+        LogUtil.info("长按顶部切换界面精简 -> ${if (hide) "隐藏" else "显示"} | $reason")
+        try {
+            val ctx: Context? = act ?: appCtx
+            if (ctx != null) {
+                Toast.makeText(ctx, if (hide) "已隐藏界面控件" else "已恢复界面控件", Toast.LENGTH_SHORT).show()
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun dpToPx(dp: Float): Float {
+        val density = try {
+            gCurrentActivity?.resources?.displayMetrics?.density
+        } catch (_: Throwable) { null } ?: 3f
+        return dp * density
+    }
+
+    private fun cancelLongPressTimer() {
+        gLongPressRunnable?.let { mainHandler.removeCallbacks(it) }
+        gLongPressRunnable = null
+    }
+
+    private fun resetTopLongPressState() {
+        cancelLongPressTimer()
+        gLongPressTracking = false
+        gLongPressConsuming = false
+    }
+
+    private fun cancelHostTouchSequence() {
+        val act = gCurrentActivity ?: return
+        try {
+            val now = android.os.SystemClock.uptimeMillis()
+            val cancel = android.view.MotionEvent.obtain(
+                now, now, android.view.MotionEvent.ACTION_CANCEL,
+                gLongPressLocalX, gLongPressLocalY, 0,
+            )
+            gInjectingCancel = true
+            try { act.dispatchTouchEvent(cancel) } finally {
+                gInjectingCancel = false
+                cancel.recycle()
+            }
+        } catch (_: Throwable) { gInjectingCancel = false }
+    }
+
+    private fun handleTopLongPressEvent(ev: android.view.MotionEvent?): Boolean {
+        if (ev == null || gInjectingCancel) return false
+        try {
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    resetTopLongPressState()
+                    if (ev.rawY > dpToPx(TOP_LONG_PRESS_ZONE_DP)) return false
+
+                    gLongPressTracking = true
+                    gLongPressStartX = ev.rawX
+                    gLongPressStartY = ev.rawY
+                    gLongPressLocalX = ev.x
+                    gLongPressLocalY = ev.y
+                    val runnable = Runnable {
+                        if (!gLongPressTracking) return@Runnable
+                        gLongPressTracking = false
+
+                        gLongPressConsuming = true
+                        cancelHostTouchSequence()
+                        applyCleanUiGroup(!gControlOn, "long-press")
+                    }
+                    gLongPressRunnable = runnable
+                    mainHandler.postDelayed(runnable, TOP_LONG_PRESS_TIMEOUT_MS)
+
+                    return false
+                }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (gLongPressTracking) {
+                        val slop = dpToPx(TOP_LONG_PRESS_SLOP_DP)
+                        if (kotlin.math.abs(ev.rawX - gLongPressStartX) > slop ||
+                            kotlin.math.abs(ev.rawY - gLongPressStartY) > slop
+                        ) {
+                            cancelLongPressTimer()
+                            gLongPressTracking = false
+                        }
+                    }
+                    return gLongPressConsuming
+                }
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                    val consuming = gLongPressConsuming
+                    resetTopLongPressState()
+                    return consuming
+                }
+            }
+        } catch (_: Throwable) { resetTopLongPressState() }
+        return gLongPressConsuming
+    }
+
 
     private fun findNativeSettingsContainer(root: View?): ViewGroup? {
         if (root !is ViewGroup) return null
@@ -4791,7 +4973,7 @@ object Hooks {
         try { val c = Class.forName("androidx.swiperefreshlayout.widget.SwipeRefreshLayout", false, classLoader); module.hook(c.getDeclaredMethod("onInterceptTouchEvent", android.view.MotionEvent::class.java)).setId("sw").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain -> if (gMasterOn && gRefreshOff) false else chain.proceed() }); LogUtil.info("  ✓ swipe") } catch (e: Exception) { LogUtil.warn("  SwipeRefreshLayout 未找到") }
 
         try { val c = Class.forName(gNames.topZoneTouch, false, classLoader); module.hook(c.getDeclaredMethod("onTouchEvent", android.view.MotionEvent::class.java)).setId("tz1").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain -> if (gMasterOn && gTopZoneOn && handleTopZoneEvent(chain.getArg(0) as? android.view.MotionEvent)) true else chain.proceed() }); LogUtil.info("  ✓ ${gNames.topZoneTouch}") } catch (e: Exception) { LogUtil.warn("  ${gNames.topZoneTouch} 未找到") }
-        try { val c = Class.forName("android.app.Activity", false, classLoader); module.hook(c.getDeclaredMethod("dispatchTouchEvent", android.view.MotionEvent::class.java)).setId("tz2").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain -> if (gMasterOn && gTopZoneOn && handleTopZoneEvent(chain.getArg(0) as? android.view.MotionEvent)) true else chain.proceed() }); LogUtil.info("  ✓ dispatchTouch") } catch (e: Exception) { LogUtil.error("tz2", e) }
+        try { val c = Class.forName("android.app.Activity", false, classLoader); module.hook(c.getDeclaredMethod("dispatchTouchEvent", android.view.MotionEvent::class.java)).setId("tz2").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain -> val ev = chain.getArg(0) as? android.view.MotionEvent; if (gMasterOn && gTopLongPressOn && handleTopLongPressEvent(ev)) true else if (gMasterOn && gTopZoneOn && handleTopZoneEvent(ev)) true else chain.proceed() }); LogUtil.info("  ✓ dispatchTouch") } catch (e: Exception) { LogUtil.error("tz2", e) }
 
         try {
             val c = Class.forName("android.app.Activity", false, classLoader)
