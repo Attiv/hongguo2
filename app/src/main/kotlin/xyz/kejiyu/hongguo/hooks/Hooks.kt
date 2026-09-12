@@ -1,3 +1,5 @@
+@file:Suppress("NotificationPermission", "UnspecifiedRegisterReceiverFlag")
+
 package xyz.kejiyu.hongguo.hooks
 
 import android.app.Activity
@@ -123,10 +125,6 @@ object Hooks {
         override fun initialValue(): Boolean = false
     }
 
-    private val gSavedTopMargins = java.util.Collections.synchronizedMap(
-        java.util.WeakHashMap<View, Int>()
-    )
-
     private data class SavedBottomLayoutState(
         val width: Int,
         val height: Int,
@@ -174,12 +172,7 @@ object Hooks {
         java.util.WeakHashMap<Activity, Int>()
     )
 
-    private val gStatusBarTouched = java.util.Collections.synchronizedMap(
-        java.util.WeakHashMap<Activity, Boolean>()
-    )
-    private val gNavBarTouched = java.util.Collections.synchronizedMap(
-        java.util.WeakHashMap<Activity, Boolean>()
-    )
+    private val gNativeSystemBars = NativeSystemBars()
 
     private val gFeedViewportNativeBottomMargins = java.util.Collections.synchronizedMap(
         java.util.WeakHashMap<View, Int>()
@@ -212,6 +205,7 @@ object Hooks {
     private val gPauseRestoreIdSet = mutableSetOf<Int>()
     private val hideClasses: List<String> get() = listOf(gNames.hideView1, gNames.hideView2).filter { it.isNotBlank() }
     @Volatile private var gNames: TargetNames.Names = TargetNames.CN
+    @Volatile private var gQualityNames = QualityTargetNames.forVersion(TargetNames.CN_PACKAGE, null, TargetNames.CN)
     @Volatile private var gPkg = TargetNames.CN_PACKAGE
     @Volatile private var gTargetVersionName = "未知"
     @Volatile private var gTargetVersionCode = -1L
@@ -242,6 +236,21 @@ object Hooks {
     private var gLongPressRunnable: Runnable? = null
     @Volatile private var gInjectingCancel = false
 
+    private const val VIDEO_SCALE_PREF = "video_scale_mode"
+
+    private const val VIDEO_SCALE_FOLLOW = -1
+    private val VIDEO_SCALE_OPTIONS = listOf(
+        VIDEO_SCALE_FOLLOW to "跟随应用（不干预）",
+        0 to "模式 0",
+        1 to "模式 1",
+        2 to "模式 2",
+        3 to "模式 3",
+    )
+    @Volatile private var gVideoScaleMode = VIDEO_SCALE_FOLLOW
+    private val gKnownMediaViews = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Any, Boolean>()
+    )
+
     private val seedIds = intArrayOf(
         0x7F0B03E3, 0x7F0B071E, 0x7F0B0412,
         0x7F0B0BCB, 0x7F0A00D2, 0x7F0B0C6A,
@@ -259,6 +268,7 @@ object Hooks {
             gRefreshOff = gPrefs!!.getBoolean("pull_refresh", false)
             gTopZoneOn = gPrefs!!.getBoolean("top_zone", false)
             gTopLongPressOn = gPrefs!!.getBoolean(TOP_LONG_PRESS_PREF, true)
+            gVideoScaleMode = gPrefs!!.getInt(VIDEO_SCALE_PREF, VIDEO_SCALE_FOLLOW)
             gNavBarOff = gPrefs!!.getBoolean("nav_bar_off", false)
             gProgressOff = gPrefs!!.getBoolean("progress_off", false)
             gRestoreControlsOnPause = gPrefs!!.getBoolean("restore_controls_pause", false)
@@ -2150,7 +2160,14 @@ object Hooks {
         gScanRunnable?.let { mainHandler.removeCallbacks(it) }
         gScanRunnable = null
     }
-    private fun applyToCurrent() { mainHandler.post { scanAllWindows() } }
+    private fun applyToCurrent() {
+        mainHandler.post {
+            val act = gCurrentActivity
+            if (gMasterOn && gStatusOn) applyCleanTop(act) else showStatusBar(act)
+            if (gMasterOn && gNavBarOff) applyNavBar(act) else showNavBar(act)
+            scanAllWindows()
+        }
+    }
 
     private fun isWindowedMode(act: Activity?): Boolean {
         if (act == null) return false
@@ -2175,280 +2192,68 @@ object Hooks {
         return gMasterOn && gStatusOn
     }
 
-    private fun updateSeriesMallTopMargin(act: Activity, statusHidden: Boolean) {
-        try {
-
-            val topBarId = act.resources.getIdentifier("is7", "id", gPkg)
-            if (topBarId == 0) return
-            val topBar = act.findViewById<View>(topBarId) ?: return
-            val params = topBar.layoutParams as? ViewGroup.MarginLayoutParams ?: return
-            if (statusHidden) {
-                synchronized(gSavedTopMargins) {
-                    if (!gSavedTopMargins.containsKey(topBar)) gSavedTopMargins[topBar] = params.topMargin
-                }
-                if (params.topMargin != 0) {
-                    params.topMargin = 0
-                    topBar.layoutParams = params
-                    topBar.requestLayout()
-                }
-            } else {
-                val original = synchronized(gSavedTopMargins) { gSavedTopMargins.remove(topBar) } ?: return
-                if (params.topMargin != original) {
-                    params.topMargin = original
-                    topBar.layoutParams = params
-                    topBar.requestLayout()
-                }
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun refreshOneShortVideoHolder(
-        holder: Any,
-        configuration: android.content.res.Configuration,
-    ) {
-        try {
-            holder.javaClass.getMethod(gNames.shortConfigMethod, android.content.res.Configuration::class.java)
-                .invoke(holder, configuration)
-
-            holder.javaClass.getMethod(gNames.shortLayoutResetMethod).invoke(holder)
-        } catch (_: Throwable) {}
-        shortVideoHolderRoot(holder)?.requestLayout()
-    }
-
-    private fun refreshShortVideoWindowLayout(act: Activity) {
-        val configuration = act.resources.configuration
-
-        for (fragment in shortSeriesFragmentSnapshot().asReversed()) {
-            if (activityFromFragment(fragment) !== act) continue
-            for (fieldName in gNames.seriesLayoutFields) {
-                val view = findFieldValue(fragment, fieldName) as? View ?: continue
-                try { view.requestLayout() } catch (_: Throwable) {}
-            }
-            try {
-                val pager = fragment.javaClass.getMethod(gNames.seriesPagerGetter).invoke(fragment) ?: continue
-                val holder = pager.javaClass.getMethod(gNames.seriesHolderGetter).invoke(pager) ?: continue
-                registerShortVideoHolder(holder)
-                refreshOneShortVideoHolder(holder, configuration)
-            } catch (_: Throwable) {}
-        }
-
-        for ((holder, _) in shortVideoHolderSnapshot().asReversed()) {
-            if (!isShortVideoHolderVisible(holder)) continue
-            refreshOneShortVideoHolder(holder, configuration)
-        }
-    }
-
-    private fun applyWindowedTop(act: Activity) {
-        try {
-            val window = act.window ?: return
-            val decor = window.decorView
-
-            fun applyOnce() {
-
-                window.clearFlags(
-                    WindowManager.LayoutParams.FLAG_FULLSCREEN or
-                        WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
-                )
-                window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
-                if (Build.VERSION.SDK_INT >= 28) {
-                    val attrs = window.attributes
-                    attrs.layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
-                    window.attributes = attrs
-                }
-
-                if (Build.VERSION.SDK_INT >= 30) {
-
-                    @Suppress("DEPRECATION")
-                    decor.systemUiVisibility = decor.systemUiVisibility and
-                        View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN.inv() and
-                        View.SYSTEM_UI_FLAG_FULLSCREEN.inv() and
-                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY.inv()
-                    window.setDecorFitsSystemWindows(false)
-                    window.statusBarColor = Color.TRANSPARENT
-                    decor.windowInsetsController?.apply {
-                        setSystemBarsAppearance(0, WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS)
-                        if (Build.VERSION.SDK_INT >= 35) {
-                            setSystemBarsAppearance(
-                                WindowInsetsController.APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND,
-                                WindowInsetsController.APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND,
-                            )
-                        }
-                        var topTypes = WindowInsets.Type.statusBars() or WindowInsets.Type.captionBar()
-                        if (Build.VERSION.SDK_INT >= 34) {
-                            topTypes = topTypes or WindowInsets.Type.systemOverlays()
-                        }
-                        hide(topTypes)
-                        systemBarsBehavior =
-                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    }
-                } else {
-
-                    @Suppress("DEPRECATION")
-                    decor.systemUiVisibility = decor.systemUiVisibility or
-                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                        View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                        View.SYSTEM_UI_FLAG_FULLSCREEN or
-                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    window.statusBarColor = Color.BLACK
-                }
-                decor.requestApplyInsets()
-                updateSeriesMallTopMargin(act, true)
-                synchronized(gStatusBarTouched) { gStatusBarTouched[act] = true }
-            }
-
-            applyOnce()
-
-            for (delay in longArrayOf(120L, 360L)) mainHandler.postDelayed({
-                if (!act.isFinishing && isWindowedMode(act) && gMasterOn && gStatusOn) {
-                    applyOnce()
-                    refreshShortVideoWindowLayout(act)
-                }
-            }, delay)
-        } catch (e: Throwable) {
-            LogUtil.warn("apply windowed mode failed: $e")
-        }
-    }
-
-    private fun isSystemBarHidden(act: Activity, statusBar: Boolean): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= 30) {
-                val insets = act.window?.decorView?.rootWindowInsets ?: return false
-                val type = if (statusBar) WindowInsets.Type.statusBars() else WindowInsets.Type.navigationBars()
-                !insets.isVisible(type)
-            } else {
-                @Suppress("DEPRECATION")
-                (act.window.attributes.flags and WindowManager.LayoutParams.FLAG_FULLSCREEN) != 0
-            }
-        } catch (_: Throwable) { false }
-    }
-
-    private fun systemBarsMatchTarget(act: Activity): Boolean {
-        val statusOk = isSystemBarHidden(act, true) == gStatusOn
-        val navOk = isSystemBarHidden(act, false) == gNavBarOff
-        return statusOk && navOk
-    }
-
-    private fun reapplyAfterWindowModeChange(
-        act: Activity?,
-        reason: String,
-        refreshLayout: Boolean = true,
-    ) {
-        if (act == null || !gMasterOn) return
+    private fun reapplyAfterWindowModeChange(act: Activity?, reason: String) {
+        if (act == null) return
         for (delay in longArrayOf(0L, 180L)) mainHandler.postDelayed({
-            if (act.isFinishing) return@postDelayed
+            if (act.isFinishing || act.isDestroyed || gCurrentActivity !== act) return@postDelayed
             val windowed = isWindowedMode(act)
-            val modeChanged = gLastWindowedMode != windowed
-            if (modeChanged) {
+            if (gLastWindowedMode != windowed) {
                 gLastWindowedMode = windowed
                 LogUtil.info("window mode -> ${if (windowed) "windowed" else "fullscreen"}, reason=$reason")
             }
-
-            val alreadySettled = !modeChanged && systemBarsMatchTarget(act)
-            if (gStatusOn) applyCleanTop(act) else showStatusBar(act)
-            if (gNavBarOff) applyNavBar(act) else showNavBar(act)
-
-            val needRefresh = refreshLayout && !alreadySettled &&
-                (modeChanged || isWindowedMode(act))
-            if (needRefresh) refreshShortVideoWindowLayout(act)
+            if (gMasterOn && gStatusOn) applyCleanTop(act) else showStatusBar(act)
+            if (gMasterOn && gNavBarOff) applyNavBar(act) else showNavBar(act)
+            // A real configuration callback is already handled by the host.
+            // Calling its config/layout-reset methods again changes video framing.
         }, delay)
     }
 
-    private fun reapplySeriesPageState(
-        owner: Any?,
-        reason: String,
-        refreshLayout: Boolean = true,
-    ) {
+    private fun reapplySeriesPageState(owner: Any?, reason: String) {
         val act = owner as? Activity ?: activityFromFragment(owner) ?: return
-        reapplyAfterWindowModeChange(act, reason, refreshLayout)
+        reapplyAfterWindowModeChange(act, reason)
         mainHandler.postDelayed({
-            if (act.isFinishing) return@postDelayed
-
-            if (refreshLayout && isWindowedMode(act)) refreshShortVideoWindowLayout(act)
-            if (gRestoreControlsOnPause) {
-                refreshVideoPauseState("series-window:$reason")
-            }
+            if (act.isFinishing || act.isDestroyed || gCurrentActivity !== act) return@postDelayed
+            if (gRestoreControlsOnPause) refreshVideoPauseState("series-window:$reason")
             scanAllWindows()
         }, 80L)
     }
 
     private fun applyCleanTop(act: Activity?) {
         if (act == null || !gMasterOn || !gStatusOn) return
-        if (isWindowedMode(act)) {
-            applyWindowedTop(act)
-            return
-        }
         try {
-            val window = act.window ?: return
-            val decor = window.decorView
-
-            if (Build.VERSION.SDK_INT >= 30) {
-                window.setDecorFitsSystemWindows(false)
+            if (gNativeSystemBars.hide(act.window, statusBar = true)) {
+                logNativeVideoBounds(act, "status foreground hidden")
             }
-            if (Build.VERSION.SDK_INT >= 28) {
-                val attrs = window.attributes
-                attrs.layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                } else {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
-                window.attributes = attrs
-            }
-
-            window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS)
-            window.addFlags(
-                WindowManager.LayoutParams.FLAG_FULLSCREEN or
-                    WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
-            )
-            window.statusBarColor = Color.TRANSPARENT
-
-            if (Build.VERSION.SDK_INT >= 30) {
-                decor.windowInsetsController?.apply {
-                    hide(WindowInsets.Type.statusBars())
-                    systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                }
-            }
-
-            @Suppress("DEPRECATION")
-            decor.systemUiVisibility = decor.systemUiVisibility or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-            decor.requestApplyInsets()
-            updateSeriesMallTopMargin(act, true)
-            synchronized(gStatusBarTouched) { gStatusBarTouched[act] = true }
-        } catch (_: Exception) {}
+        } catch (e: Throwable) { LogUtil.warn("hide status foreground failed: $e") }
     }
+
     private fun showStatusBar(act: Activity?) {
         if (act == null) return
-
-        val touched = synchronized(gStatusBarTouched) { gStatusBarTouched.remove(act) }
-        if (touched != true) return
         try {
-            val window = act.window ?: return
-            val decor = window.decorView
-            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
-            if (Build.VERSION.SDK_INT >= 30) {
+            if (gNativeSystemBars.restore(act.window, statusBar = true)) {
+                logNativeVideoBounds(act, "status foreground restored")
+            }
+        } catch (e: Throwable) { LogUtil.warn("restore status foreground failed: $e") }
+    }
 
-                window.setDecorFitsSystemWindows(false)
-                var topTypes = WindowInsets.Type.statusBars()
-                if (isWindowedMode(act)) topTypes = topTypes or WindowInsets.Type.captionBar()
-                decor.windowInsetsController?.show(topTypes)
+    private fun logNativeVideoBounds(act: Activity, reason: String) {
+        val decor = act.window.decorView
+        // Log actual laid-out geometry after the foreground operation, not guessed IDs.
+        decor.post {
+            if (act.isFinishing || act.isDestroyed) return@post
+            fun scan(view: View) {
+                if (view.visibility != View.VISIBLE) return
+                if (view.javaClass.name == "com.dragon.read.component.shortvideo.impl.v2.view.holder.RoundFrameLayout") {
+                    val rect = Rect()
+                    if (view.getGlobalVisibleRect(rect)) {
+                        LogUtil.info("native video bounds | $reason | rect=$rect | decor=${decor.width}x${decor.height}")
+                    }
+                    return
+                }
+                if (view is ViewGroup) for (i in 0 until view.childCount) scan(view.getChildAt(i))
             }
-            if (Build.VERSION.SDK_INT >= 28) {
-                val attrs = window.attributes
-                attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
-                window.attributes = attrs
-            }
-            @Suppress("DEPRECATION")
-            decor.systemUiVisibility = decor.systemUiVisibility and
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN.inv() and
-                View.SYSTEM_UI_FLAG_FULLSCREEN.inv() and
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY.inv()
-            decor.requestApplyInsets()
-            updateSeriesMallTopMargin(act, false)
-        } catch (_: Exception) {}
+            scan(decor)
+        }
     }
 
     private fun applyBottomEdgeToEdge(act: Activity?, hideNavigationBar: Boolean) {
@@ -2517,19 +2322,20 @@ object Hooks {
 
     private fun applyNavBar(act: Activity?) {
         if (act == null || !gMasterOn || !gNavBarOff) return
-        applyBottomEdgeToEdge(act, true)
-        synchronized(gNavBarTouched) { gNavBarTouched[act] = true }
+        try {
+            if (gNativeSystemBars.hide(act.window, statusBar = false)) {
+                logNativeVideoBounds(act, "navigation foreground hidden")
+            }
+        } catch (e: Throwable) { LogUtil.warn("hide navigation foreground failed: $e") }
     }
+
     private fun showNavBar(act: Activity?) {
         if (act == null) return
-
-        val touched = synchronized(gNavBarTouched) { gNavBarTouched.remove(act) }
-        if (touched != true) return
         try {
-            val decor = act.window.decorView
-            if (Build.VERSION.SDK_INT >= 30) decor.windowInsetsController?.show(WindowInsets.Type.navigationBars())
-            else @Suppress("DEPRECATION") decor.systemUiVisibility = decor.systemUiVisibility and View.SYSTEM_UI_FLAG_HIDE_NAVIGATION.inv()
-        } catch (_: Exception) {}
+            if (gNativeSystemBars.restore(act.window, statusBar = false)) {
+                logNativeVideoBounds(act, "navigation foreground restored")
+            }
+        } catch (e: Throwable) { LogUtil.warn("restore navigation foreground failed: $e") }
     }
 
     private fun resolutionRank(resolution: Any?): Int {
@@ -2606,20 +2412,20 @@ object Hooks {
     }
 
     private fun applyHighestViaController(controller: Any?, highest: Any?): Boolean {
-        if (controller == null || highest == null || gNames.resolutionApplyMethod.isBlank()) return false
+        if (controller == null || highest == null || gQualityNames.resolutionApplyMethod.isBlank()) return false
         return try {
             var clazz: Class<*>? = controller.javaClass
             var target: java.lang.reflect.Method? = null
             while (clazz != null && target == null) {
                 target = clazz.declaredMethods.firstOrNull {
-                    it.name == gNames.resolutionApplyMethod && it.parameterCount == 1 &&
+                    it.name == gQualityNames.resolutionApplyMethod && it.parameterCount == 1 &&
                         it.parameterTypes[0].isInstance(highest)
                 }?.apply { isAccessible = true }
                 clazz = clazz.superclass
             }
             if (target == null) return false
             target.invoke(controller, highest)
-            LogUtil.info("最高画质：原生控制器 ${gNames.resolutionApplyMethod}($highest)")
+            LogUtil.info("最高画质：原生控制器 ${gQualityNames.resolutionApplyMethod}($highest)")
             LogUtil.incr("maxQualityNativeApply")
             true
         } catch (e: Throwable) {
@@ -2927,6 +2733,122 @@ object Hooks {
         }
     }
 
+    private fun videoScaleLabel(mode: Int): String =
+        VIDEO_SCALE_OPTIONS.firstOrNull { it.first == mode }?.second ?: "模式 $mode"
+
+    private fun videoScaleSummary(): String = "当前 ${videoScaleLabel(gVideoScaleMode)}"
+
+    private fun registerMediaView(view: Any?) {
+        if (view == null) return
+        synchronized(gKnownMediaViews) { gKnownMediaViews[view] = true }
+    }
+
+    private fun applyVideoScaleTo(view: Any, mode: Int): Boolean {
+        return try {
+            val method = view.javaClass.methods.firstOrNull {
+                it.name == "setTextureLayout" && it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == Integer.TYPE
+            } ?: return false
+            method.isAccessible = true
+            method.invoke(view, mode)
+            true
+        } catch (_: Throwable) { false }
+    }
+
+    private fun applyVideoScaleNow(reason: String) {
+        if (!gMasterOn || gVideoScaleMode == VIDEO_SCALE_FOLLOW) return
+        val run = Runnable {
+            val views = synchronized(gKnownMediaViews) { gKnownMediaViews.keys.toList() }
+            var applied = 0
+            for (v in views) if (applyVideoScaleTo(v, gVideoScaleMode)) applied++
+            LogUtil.info("画面显示模式已应用 | mode=$gVideoScaleMode | views=$applied | reason=$reason")
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) run.run() else mainHandler.post(run)
+    }
+
+    private fun saveVideoScaleMode(mode: Int) {
+        gVideoScaleMode = mode
+        gPrefs?.edit()?.putInt(VIDEO_SCALE_PREF, mode)?.apply()
+    }
+
+    private fun showVideoScaleEditor(act: Activity, p: PanelPalette, onSelected: () -> Unit) {
+        try {
+            val dialog = Dialog(act)
+            dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+            val root = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(act, 18f), dp(act, 18f), dp(act, 18f), dp(act, 16f))
+                background = roundedBg(act, p.page, 26f, p.divider, 1f)
+            }
+            root.addView(TextView(act).apply {
+                text = "画面显示模式"
+                textSize = 20f
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(p.text)
+                includeFontPadding = false
+            })
+            root.addView(TextView(act).apply {
+                text = "强制指定播放器的画面缩放方式，切到下一集后生效。若某个模式表现异常，改回跟随应用即可"
+                textSize = 11.5f
+                setTextColor(p.textSecondary)
+                includeFontPadding = false
+                setPadding(0, dp(act, 6f), 0, dp(act, 10f))
+            })
+
+            VIDEO_SCALE_OPTIONS.forEach { (mode, label) ->
+                val selected = mode == gVideoScaleMode
+                val row = LinearLayout(act).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(act, 15f), dp(act, 12f), dp(act, 15f), dp(act, 12f))
+                    background = roundedBg(act, if (selected) p.accentSoft else p.surfaceAlt, 16f)
+                    minimumHeight = dp(act, 50f)
+                }
+                row.addView(TextView(act).apply {
+                    text = label
+                    textSize = 15f
+                    setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                    setTextColor(if (selected) p.accent else p.text)
+                    includeFontPadding = false
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                row.addView(TextView(act).apply {
+                    text = if (selected) "✓" else ""
+                    textSize = 18f
+                    setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                    setTextColor(p.accent)
+                    gravity = Gravity.CENTER
+                    includeFontPadding = false
+                }, LinearLayout.LayoutParams(dp(act, 30f), ViewGroup.LayoutParams.WRAP_CONTENT))
+                row.setOnClickListener {
+                    saveVideoScaleMode(mode)
+                    onSelected()
+                    dialog.dismiss()
+                    applyVideoScaleNow("menu-select")
+                    Toast.makeText(act, "画面显示模式：${videoScaleLabel(mode)}", Toast.LENGTH_SHORT).show()
+                }
+                root.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(act, 7f)
+                })
+            }
+
+            dialog.setContentView(root)
+            dialog.setCanceledOnTouchOutside(true)
+            dialog.setOnShowListener {
+                try {
+                    dialog.window?.apply {
+                        setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+                        addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                        attributes = attributes.apply { dimAmount = 0.62f }
+                        setLayout((act.resources.displayMetrics.widthPixels * 0.82f).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+                    }
+                } catch (e: Throwable) { LogUtil.error("画面模式窗口", e) }
+            }
+            dialog.show()
+        } catch (e: Throwable) {
+            LogUtil.error("画面模式编辑", e)
+        }
+    }
+
     private fun downloadLimitSummary(): String {
         val (episode, series, total) = currentDownloadLimitValues()
         return "单日集数 $episode  ·  单日剧数 $series  ·  总缓存 $total"
@@ -3215,7 +3137,7 @@ object Hooks {
             }, "master_on", true)
 
             content.addView(sectionTitle(act, "界面精简", p))
-            addSwitch("隐藏状态栏", "视频页面沉浸显示；开启后部分视频会改为留黑边显示", { gStatusOn }, { gStatusOn = it }, "status_bar")
+            addSwitch("隐藏状态栏", "只隐藏时间、电量等状态栏图标，保留原生视频布局", { gStatusOn }, { gStatusOn = it }, "status_bar")
             addSwitch("隐藏控件", "隐藏顶部/底部导航、作品信息和右侧互动等已适配区域", { gControlOn }, {
                 gControlOn = it
                 if (!it) {
@@ -3238,7 +3160,7 @@ object Hooks {
                     for (root in roots) scanTreeProgressRestore(root)
                 }
             }, "progress_off")
-            addSwitch("隐藏底部小白条", "隐藏系统手势导航提示条；开启后部分视频会改为留黑边显示", { gNavBarOff }, { gNavBarOff = it }, "nav_bar_off")
+            addSwitch("隐藏底部小白条", "只隐藏系统手势导航提示条，不修改视频和选集栏布局", { gNavBarOff }, { gNavBarOff = it }, "nav_bar_off")
             addSwitch("暂停后恢复所有控件", "暂停视频时临时恢复控件，继续播放后按规则隐藏", { gRestoreControlsOnPause }, {
                 gRestoreControlsOnPause = it
                 if (it) refreshVideoPauseState("switch-enabled", gVideoPaused)
@@ -3246,7 +3168,24 @@ object Hooks {
             }, "restore_controls_pause")
 
             content.addView(sectionTitle(act, "播放与手势", p))
-            if (gNames.resolutionController.isNotBlank()) {
+            run {
+                val (scaleRow, _) = makePanelRow(
+                    act, "画面显示模式", videoScaleSummary(), false, p, false, true,
+                )
+                scaleRow.getChildAt(1)?.visibility = View.GONE
+                scaleRow.setOnClickListener {
+                    showVideoScaleEditor(act, p) {
+                        try {
+                            val labels = scaleRow.getChildAt(0) as? ViewGroup
+                            (labels?.getChildAt(1) as? TextView)?.text = videoScaleSummary()
+                        } catch (_: Throwable) {}
+                    }
+                }
+                content.addView(scaleRow, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(act, 7f) })
+            }
+            if (gQualityNames.resolutionController.isNotBlank()) {
                 addSwitch("默认最高画质", "播放时自动选择当前视频支持的最高画质", { gMaxQualityOn }, {
                     gMaxQualityOn = it
                     if (it) mainHandler.post { applyHighestToKnownEngines() }
@@ -3932,6 +3871,7 @@ object Hooks {
         gTargetVersionCode = detected.second
 
         gNames = TargetNames.namesFor(pkg, detected.first, classLoader)
+        gQualityNames = QualityTargetNames.forVersion(pkg, detected.first, gNames, classLoader)
 
         if (gNames.useLegacySeedIds) seedIds.forEach { gTargetIdSet.add(it) }
         gNames.staticHideIds.forEach { gTargetIdSet.add(it) }
@@ -4258,17 +4198,17 @@ object Hooks {
             }
         }
 
-        if (gNames.resolutionController.isNotBlank()) {
+        if (gQualityNames.resolutionController.isNotBlank()) {
             try {
-                val controllerClass = Class.forName(gNames.resolutionController, false, classLoader)
-                val engineField = controllerClass.getDeclaredField(gNames.resolutionEngineField).apply { isAccessible = true }
-                for ((methodIndex, methodName) in gNames.resolutionModelMethods.withIndex()) {
+                val controllerClass = Class.forName(gQualityNames.resolutionController, false, classLoader)
+                val engineField = controllerClass.getDeclaredField(gQualityNames.resolutionEngineField).apply { isAccessible = true }
+                for ((methodIndex, methodName) in gQualityNames.resolutionModelMethods.withIndex()) {
                     ham(controllerClass, methodName, "maxQualityModel_${methodIndex}") { chain ->
                         val controller = chain.thisObject
                         val model = try { chain.getArg(0) } catch (_: Throwable) { null }
                         val highest = findHighestResolution(model)
 
-                        if (gNames.resolutionApplyMethod.isBlank()) {
+                        if (gQualityNames.resolutionApplyMethod.isBlank()) {
 
                             try {
                                 val engineBefore = if (controller != null) engineField.get(controller) else null
@@ -4282,7 +4222,7 @@ object Hooks {
                         try {
                             if (highest != null) {
                                 LogUtil.info("最高画质：检测到 $highest rank=${resolutionRank(highest)}")
-                                if (gNames.resolutionApplyMethod.isNotBlank()) {
+                                if (gQualityNames.resolutionApplyMethod.isNotBlank()) {
 
                                     if (gMasterOn && gMaxQualityOn) applyHighestViaController(controller, highest)
                                 } else {
@@ -4297,7 +4237,7 @@ object Hooks {
                     }
                 }
 
-                if (gNames.resolutionApplyMethod.isBlank()) {
+                if (gQualityNames.resolutionApplyMethod.isBlank()) {
                     val engineClass = Class.forName("com.ss.ttvideoengine.TTVideoEngine", false, classLoader)
                     ham(engineClass, "configResolution", "maxQualityConfig") { chain ->
                         if (!gMasterOn || !gMaxQualityOn) return@ham chain.proceed()
@@ -4316,9 +4256,9 @@ object Hooks {
                         } catch (_: Throwable) {}
                         chain.proceed()
                     }
-                    LogUtil.info("  ✓ 默认最高画质 ${gNames.resolutionController} + TTVideoEngine")
+                    LogUtil.info("  ✓ 默认最高画质 ${gQualityNames.resolutionController} + TTVideoEngine")
                 } else {
-                    LogUtil.info("  ✓ 默认最高画质 ${gNames.resolutionController}.${gNames.resolutionApplyMethod}（原生切画质链）")
+                    LogUtil.info("  ✓ 默认最高画质 ${gQualityNames.resolutionController}.${gQualityNames.resolutionApplyMethod}（原生切画质链）")
                 }
             } catch (e: Throwable) {
                 LogUtil.warn("  默认最高画质 Hook 失败: $e")
@@ -4384,13 +4324,9 @@ object Hooks {
                     ham(c, methodName, "seriesWindow_${classIndex}_$methodName") { chain ->
                         val result = chain.proceed()
 
-                        val shouldRefreshLayout = methodName == "onConfigurationChanged" ||
-                            methodName == "onMultiWindowModeChanged" ||
-                            methodName == "onPictureInPictureModeChanged"
                         reapplySeriesPageState(
                             chain.thisObject,
                             "$className#$methodName",
-                            refreshLayout = shouldRefreshLayout,
                         )
                         result
                     }
@@ -4422,7 +4358,6 @@ object Hooks {
                     reapplySeriesPageState(
                         chain.thisObject,
                         "$className#$methodName",
-                        refreshLayout = methodName != gNames.seriesFragmentRefreshMethod,
                     )
                     result
                 }
@@ -4443,33 +4378,22 @@ object Hooks {
                 result
             }
             ham(c, "hideStatusBar", "sbH") { chain ->
-                if (!shouldHideStatusBar()) {
-                    chain.proceed()
-                } else try {
-                    if (chain.args.size >= 2 && chain.getArg(1) is Boolean && !(chain.getArg(1) as Boolean)) {
-                        val args = (chain.args as Array<Any?>).copyOf()
-                        args[1] = true
-                        chain.proceed(args)
-                    } else chain.proceed()
-                } catch (_: Exception) { chain.proceed() }
+                // Preserve the host's arguments and its native layout decisions.
+                val result = chain.proceed()
+                if (shouldHideStatusBar()) {
+                    val window = chain.args.firstOrNull() as? android.view.Window
+                    mainHandler.post {
+                        if (shouldHideStatusBar() && window != null) {
+                            gNativeSystemBars.hide(window, statusBar = true)
+                        }
+                    }
+                }
+                result
             }
-
-            ham(c, "getStatusHeight", "sbHeight") { chain ->
-                if (shouldHideStatusBar()) 0 else chain.proceed()
-            }
+            // Do not hook getStatusHeight: the host intentionally uses stable
+            // status/cutout insets even while their foreground is hidden.
             LogUtil.info("  ✓ StatusBarUtil")
         } catch (e: Exception) { LogUtil.warn("  StatusBarUtil 未找到") }
-
-        try {
-            val c = Class.forName("com.bytedance.ies.uikit.statusbar.StatusBarUtils", false, classLoader)
-            module.hook(c.getDeclaredMethod("getStatusBarHeight", Context::class.java))
-                .setId("uikitStatusHeight")
-                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                .intercept(Hooker { chain ->
-                    if (shouldHideStatusBar()) 0 else chain.proceed()
-                })
-            LogUtil.info("  ✓ UIKit StatusBarUtils")
-        } catch (e: Exception) { LogUtil.warn("  UIKit StatusBarUtils 未找到: $e") }
 
         try {
             val isNewCn = gNames.profileId == "CN-7.3.3.18"
@@ -4754,8 +4678,38 @@ object Hooks {
             LogUtil.info("  ✓ video command detector")
         } catch (e: Throwable) { LogUtil.warn("  video command detector missing: $e") }
 
-        fun hookToolbarLayer(className: String, hookId: String) {
-            try {
+        try {
+            val mediaViewClass = Class.forName(
+                "com.ss.android.videoshop.mediaview.SimpleMediaView", false, classLoader,
+            )
+            var hooked = 0
+            for (method in mediaViewClass.declaredMethods) {
+                if (method.name != "setTextureLayout") continue
+                if (method.parameterTypes.isEmpty() || method.parameterTypes[0] != Integer.TYPE) continue
+                module.hook(method).setId("texLayout$hooked")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(Hooker { chain ->
+                        registerMediaView(chain.thisObject)
+                        val mode = gVideoScaleMode
+                        if (!gMasterOn || mode == VIDEO_SCALE_FOLLOW) chain.proceed()
+                        else {
+                            val args = chain.args.toTypedArray()
+                            if (args.isNotEmpty() && args[0] != mode) {
+                                args[0] = mode
+                                LogUtil.incr("videoScaleOverride")
+                                chain.proceed(args)
+                            } else chain.proceed()
+                        }
+                    })
+                hooked++
+            }
+            if (hooked > 0) LogUtil.info("  ✓ 画面显示模式 hook: $hooked 个入口")
+            else LogUtil.warn("  SimpleMediaView.setTextureLayout 未找到")
+        } catch (e: Throwable) {
+            LogUtil.warn("  SimpleMediaView 未找到: ${e.javaClass.simpleName}")
+        }
+
+        fun hookToolbarLayer(className: String, hookId: String) {            try {
                 val c = Class.forName(className, false, classLoader)
                 hac(c, hookId) { chain ->
                     val result = chain.proceed()
