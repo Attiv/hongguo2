@@ -7,6 +7,7 @@ internal object QualityTargetNames {
         val resolutionModelMethods: List<String>,
         val resolutionEngineField: String,
         val resolutionApplyMethod: String,
+        val resolutionUserSelectionField: String = "",
     )
 
     fun forVersion(pkg: String, versionName: String?, fallback: TargetNames.Names, classLoader: ClassLoader? = null): Names {
@@ -18,7 +19,9 @@ internal object QualityTargetNames {
             // f(VideoModel) configures before play; i(VideoModel, long, String,
             // SaasVideoData) prepares the model; q(Resolution) is the host's
             // native selection path and updates controller and engine together.
-            return Names("l35.w", listOf("f", "i"), "h", "q")
+            // q also sets c (isUserSelect); onVideoStreamBitrateChanged uses it
+            // to dispatch the native selection banner. Automatic calls clear it.
+            return Names("l35.w", listOf("f", "i"), "h", "q", "c")
         }
         return Names(
             fallback.resolutionController,

@@ -2424,7 +2424,22 @@ object Hooks {
                 clazz = clazz.superclass
             }
             if (target == null) return false
-            target.invoke(controller, highest)
+            try {
+                target.invoke(controller, highest)
+            } finally {
+                // The host's native selection path labels every call as manual.
+                // Clear only that marker for our automatic calls, before the
+                // asynchronous bitrate callback; keep engine/player state intact.
+                // A later real manual selection sets the marker again normally.
+                val marker = gQualityNames.resolutionUserSelectionField
+                if (marker.isNotBlank()) {
+                    if (setFieldValue(controller, marker, false)) {
+                        LogUtil.incr("maxQualitySilentApply")
+                    } else {
+                        LogUtil.warn("最高画质：清除手动选择标记失败，保留原生提示")
+                    }
+                }
+            }
             LogUtil.info("最高画质：原生控制器 ${gQualityNames.resolutionApplyMethod}($highest)")
             LogUtil.incr("maxQualityNativeApply")
             true
