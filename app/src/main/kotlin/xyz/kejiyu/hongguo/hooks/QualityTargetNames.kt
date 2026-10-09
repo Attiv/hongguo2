@@ -12,6 +12,15 @@ internal object QualityTargetNames {
 
     fun forVersion(pkg: String, versionName: String?, fallback: TargetNames.Names, classLoader: ClassLoader? = null): Names {
         val normalized = versionName?.trim()?.substringBefore(' ')
+        val inferred73932 = pkg == TargetNames.CN_PACKAGE && normalized == null && classLoader != null &&
+            runCatching { Class.forName("e65.w", false, classLoader) }.isSuccess
+        if (pkg == TargetNames.CN_PACKAGE && (normalized == "7.3.9.32" || inferred73932)) {
+            // Verified against classes4.dex from CN 7.3.9.32. Model entry points
+            // and engine/marker fields are unchanged, but the active controller
+            // moved to e65.w and native setResolution is now r(Resolution).
+            // r sets c; the bitrate callback reads it for manual-selection UI.
+            return Names("e65.w", listOf("f", "i"), "h", "r", "c")
+        }
         val inferred73732 = pkg == TargetNames.CN_PACKAGE && normalized == null && classLoader != null &&
             runCatching { Class.forName("l35.w", false, classLoader) }.isSuccess
         if (pkg == TargetNames.CN_PACKAGE && (normalized == "7.3.7.32" || inferred73732)) {
