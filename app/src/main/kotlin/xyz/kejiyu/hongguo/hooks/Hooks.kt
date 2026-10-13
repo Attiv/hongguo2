@@ -308,6 +308,208 @@ object Hooks {
 
     private fun defaultSpeedSummary(): String = "当前 ${formatSpeed(gDefaultSpeed)}"
 
+    private fun readerFontSummary(): String {
+        if (!ReaderFontStore.isEnabled()) return "使用宿主自带字体；开启后可选用本地字体"
+        val item = ReaderFontStore.selectedItem()
+        return if (item == null) "尚未选择字体，当前仍跟随宿主" else "当前：${item.name}"
+    }
+
+    private fun readerFontItemRow(
+        act: Activity,
+        p: PanelPalette,
+        title: String,
+        subtitle: String,
+        selected: Boolean,
+        deletable: Boolean,
+        onSelect: () -> Unit,
+        onDelete: () -> Unit,
+    ): LinearLayout {
+        val row = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(act, 15f), dp(act, 11f), dp(act, 12f), dp(act, 11f))
+            background = roundedBg(act, if (selected) p.accentSoft else p.surfaceAlt, 16f)
+            minimumHeight = dp(act, 54f)
+        }
+        val labels = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        labels.addView(TextView(act).apply {
+            text = title
+            textSize = 15f
+            setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+            setTextColor(if (selected) p.accent else p.text)
+            includeFontPadding = false
+        })
+        labels.addView(TextView(act).apply {
+            text = subtitle
+            textSize = 11.5f
+            setTextColor(p.textSecondary)
+            includeFontPadding = false
+            setPadding(0, dp(act, 3f), 0, 0)
+        })
+        row.addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (selected) {
+            row.addView(TextView(act).apply {
+                text = "\u2713"
+                textSize = 18f
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(p.accent)
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+            }, LinearLayout.LayoutParams(dp(act, 30f), ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        if (deletable) {
+            row.addView(TextView(act).apply {
+                text = "删除"
+                textSize = 13f
+                setTextColor(p.textSecondary)
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                setPadding(dp(act, 8f), dp(act, 6f), dp(act, 4f), dp(act, 6f))
+                isClickable = true
+                setOnClickListener { onDelete() }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        row.setOnClickListener { onSelect() }
+        return row
+    }
+
+    private fun showReaderFontEditor(act: Activity, p: PanelPalette, onChanged: (() -> Unit)? = null) {
+        try {
+            val dialog = Dialog(act)
+            dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+            val root = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(act, 18f), dp(act, 18f), dp(act, 18f), dp(act, 16f))
+                background = roundedBg(act, p.page, 26f, p.divider, 1f)
+            }
+            root.addView(TextView(act).apply {
+                text = "阅读字体"
+                textSize = 20f
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(p.text)
+                includeFontPadding = false
+            })
+            root.addView(TextView(act).apply {
+                text = "选用手机本地字体文件（.ttf / .otf），只作用于小说阅读页正文"
+                textSize = 11.5f
+                setTextColor(p.textSecondary)
+                includeFontPadding = false
+                setPadding(0, dp(act, 6f), 0, dp(act, 10f))
+            })
+
+            val list = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
+            val scroll = ScrollView(act).apply {
+                isVerticalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                addView(list, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+            root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, 320f)))
+
+            fun rebuild() {
+                try {
+                    list.removeAllViews()
+                    val items = ReaderFontStore.items()
+                    val selectedId = ReaderFontStore.selectedId()
+                    list.addView(
+                        readerFontItemRow(
+                            act, p, "跟随宿主（默认）", "不使用自定义字体", selectedId.isEmpty(), false,
+                            onSelect = {
+                                ReaderFontStore.select("")
+                                ReaderFontStore.setEnabled(true)
+                                ReaderFontHooks.refreshReader(gCurrentActivity)
+                                dialog.dismiss()
+                                onChanged?.invoke()
+                                Toast.makeText(act, "已恢复宿主字体", Toast.LENGTH_SHORT).show()
+                            },
+                            onDelete = {},
+                        ),
+                        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                            bottomMargin = dp(act, 7f)
+                        },
+                    )
+                    items.forEach { item ->
+                        val selected = item.id == selectedId
+                        list.addView(
+                            readerFontItemRow(
+                                act, p, item.name, if (selected) "正在使用" else "本地导入", selected, true,
+                                onSelect = {
+                                    ReaderFontStore.select(item.id)
+                                    ReaderFontStore.setEnabled(true)
+                                    ReaderFontHooks.refreshReader(gCurrentActivity)
+                                    dialog.dismiss()
+                                    onChanged?.invoke()
+                                    Toast.makeText(act, "已切换到「${item.name}」", Toast.LENGTH_SHORT).show()
+                                },
+                                onDelete = {
+                                    ReaderFontStore.delete(item.id)
+                                    onChanged?.invoke()
+                                    rebuild()
+                                },
+                            ),
+                            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                                bottomMargin = dp(act, 7f)
+                            },
+                        )
+                    }
+                    if (items.isEmpty()) {
+                        list.addView(TextView(act).apply {
+                            text = "还没有本地字体，点下方按钮添加"
+                            textSize = 12.5f
+                            setTextColor(p.textSecondary)
+                            includeFontPadding = false
+                            setPadding(dp(act, 4f), dp(act, 10f), dp(act, 4f), dp(act, 10f))
+                        })
+                    }
+                } catch (e: Throwable) {
+                    LogUtil.error("阅读字体列表", e)
+                }
+            }
+            rebuild()
+
+            val add = TextView(act).apply {
+                text = "＋ 从本地添加字体（.ttf / .otf）"
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(Color.WHITE)
+                background = roundedBg(act, p.accent, 18f)
+                isClickable = true
+                isFocusable = true
+                minimumHeight = dp(act, 46f)
+                setOnClickListener { ReaderFontHooks.pickFont(act) }
+            }
+            root.addView(add, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, 46f)).apply {
+                topMargin = dp(act, 14f)
+            })
+
+            ReaderFontHooks.libraryChanged = { rebuild() }
+            dialog.setOnDismissListener { ReaderFontHooks.libraryChanged = null }
+            dialog.setContentView(root)
+            dialog.setCanceledOnTouchOutside(true)
+            dialog.setOnShowListener {
+                try {
+                    dialog.window?.apply {
+                        setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+                        addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                        attributes = attributes.apply { dimAmount = 0.62f }
+                        setLayout(
+                            (act.resources.displayMetrics.widthPixels * 0.86f).toInt(),
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                        )
+                    }
+                } catch (e: Throwable) {
+                    LogUtil.error("阅读字体窗口", e)
+                }
+            }
+            dialog.show()
+        } catch (e: Throwable) {
+            LogUtil.error("阅读字体编辑", e)
+        }
+    }
+
     private fun saveDefaultSpeedValue(value: Float) {
         gDefaultSpeed = normalizeDefaultSpeed(value)
         gPrefs?.edit()?.putFloat(DEFAULT_SPEED_VALUE_PREF, gDefaultSpeed)?.apply()
@@ -3246,6 +3448,28 @@ object Hooks {
                 TOP_LONG_PRESS_PREF,
             )
 
+            content.addView(sectionTitle(act, "阅读字体", p))
+            lateinit var readerFontRow: LinearLayout
+            val readerFontPair = addSwitch(
+                "自定义阅读字体",
+                readerFontSummary(),
+                { ReaderFontStore.isEnabled() },
+                { enabled ->
+                    ReaderFontStore.setEnabled(enabled)
+                    ReaderFontHooks.refreshReader(gCurrentActivity)
+                },
+                ReaderFontStore.PREF_ENABLED,
+                onRowAction = {
+                    showReaderFontEditor(act, p) {
+                        try {
+                            val labels = readerFontRow.getChildAt(0) as? ViewGroup
+                            (labels?.getChildAt(1) as? TextView)?.text = readerFontSummary()
+                        } catch (_: Throwable) {}
+                    }
+                },
+            )
+            readerFontRow = readerFontPair.first
+
             content.addView(sectionTitle(act, "内容与账号", p))
             addSwitch("拦截广告 / 挂件", "拦截已适配的广告层、金宝箱和悬浮挂件", { gAdOn }, { gAdOn = it }, "ad_block")
             addSwitch("解锁 VIP", "启用已适配的 VIP 状态 Hook", { gVipOn }, { gVipOn = it }, "vip_unlock")
@@ -3913,6 +4137,35 @@ object Hooks {
         }
         fun hac(clazz: Class<*>, hookId: String, block: (XposedInterface.Chain) -> Any?) {
             clazz.declaredConstructors.forEachIndexed { i, c -> try { module.hook(c).setId("${hookId}_$i").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain -> block(chain) }) } catch (_: Exception) {} }
+        }
+
+        // ── 阅读字体（小说正文）────────────────────────────────
+        // 正文由排版引擎自绘，TextView 那条路改不到；阅读器的字体解析收敛在
+        // com.dragon.read.reader.newfont.TypefaceManager，按签名接管静态入口。
+        // 实测版本 CN 7.3.9.32，见 docs/plans/2026-10-13-reader-custom-font.md。
+        try {
+            ReaderFontStore.attach(appCtx)
+            val fontHookOk = ReaderFontHooks.install(module, classLoader)
+            LogUtil.info(if (fontHookOk) "  ✓ 阅读字体 Hook | ${ReaderFontHooks.hookedSummary()}" else "  阅读字体 Hook 未启用（字体入口未命中）")
+        } catch (e: Throwable) {
+            LogUtil.error("阅读字体 Hook 安装失败", e)
+        }
+
+        try {
+            val activityClazz = Class.forName("android.app.Activity", false, classLoader)
+            module.hook(
+                activityClazz.getDeclaredMethod(
+                    "onActivityResult",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    android.content.Intent::class.java,
+                )
+            ).setId("readerFontResult")
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(Hooker { chain -> ReaderFontHooks.resultInterceptor(chain) })
+            LogUtil.info("  ✓ onActivityResult（阅读字体文件选择回传）")
+        } catch (e: Throwable) {
+            LogUtil.warn("  onActivityResult Hook 失败: $e")
         }
 
         if (pkg == TargetNames.CN_PACKAGE || pkg == TargetNames.OVERSEA_PACKAGE) {
@@ -4974,6 +5227,7 @@ object Hooks {
                 LogUtil.incr("onResume")
                 val a = chain.thisObject as? Activity
                 gCurrentActivity = a
+                ReaderFontHooks.noteActivity(a, true)
 
                 scheduleSettingsEntryInjection(a)
 
@@ -4988,6 +5242,7 @@ object Hooks {
                         initPrefs(a.applicationContext)
                         appCtx = a.applicationContext
                         ensureReceiver(a.applicationContext)
+                        ReaderFontStore.attach(a.applicationContext)
                     }
                 } catch (_: Exception) {}
                 val result = chain.proceed()
@@ -5010,6 +5265,7 @@ object Hooks {
             LogUtil.info("  ✓ onResume")
             module.hook(c.getDeclaredMethod("onPause")).setId("op").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(Hooker { chain ->
                 val a = chain.thisObject as? Activity
+                ReaderFontHooks.noteActivity(a, false)
                 stopPeriodicScan()
                 val result = chain.proceed()
                 mainHandler.postDelayed({
